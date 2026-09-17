@@ -1,0 +1,5 @@
+node_modules/
+android/
+www/vendor/phaser.min.js
+.DS_Store
+*.log
