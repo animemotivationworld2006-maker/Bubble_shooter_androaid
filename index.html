@@ -1,0 +1,2239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Bubble Burst Saga</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;background:#0a0e1a;overflow:hidden;
+    font-family:'Segoe UI',Arial,sans-serif;touch-action:none;-webkit-user-select:none;user-select:none;}
+  #game-root{width:100%;height:100%;display:flex;align-items:center;justify-content:center;}
+  canvas{touch-action:none;}
+</style>
+</head>
+<body>
+<div id="game-root"></div>
+<script src="vendor/phaser.min.js"></script>
+<script>
+'use strict';
+/* =========================================================================
+   BUBBLE BURST SAGA
+   A complete Phaser 3 bubble-shooter game.
+   Code is organized into logical modules (Config, Utils, Save, Levels,
+   Audio, Assets, Board, Shooter, Match, Float, Scenes) even though it
+   ships as a single HTML file for portability.
+   ========================================================================= */
+
+/* ============================== CONFIG ================================= */
+const CONFIG = {
+  DESIGN_W: 1080,
+  DESIGN_H: 1920,
+  BUBBLE_RADIUS: 62,
+  COLS: 8,
+  ROWS_VISIBLE: 12,
+  MAX_ROWS: 16,
+  BOARD_TOP: 260,
+  BOARD_LEFT_MARGIN: 30,
+  SHOOTER_Y: 1690,
+  SHOT_SPEED: 1900, // px/sec
+  DANGER_ROW: 13, // if bubbles reach this row -> lose
+  COLORS: [
+    { key: 'red',    hex: 0xe94560, light: 0xff7a90 },
+    { key: 'blue',   hex: 0x3f8efc, light: 0x8fc4ff },
+    { key: 'green',  hex: 0x3ecf6e, light: 0x9df5b8 },
+    { key: 'yellow', hex: 0xf5c518, light: 0xffe98a },
+    { key: 'purple', hex: 0x9b5de5, light: 0xd6b3ff },
+    { key: 'orange', hex: 0xff8c42, light: 0xffc08a }
+  ]
+};
+
+/* ============================== UTILS ==================================== */
+const Utils = {
+  clamp(v, min, max) { return Math.max(min, Math.min(max, v)); },
+  lerp(a, b, t) { return a + (b - a) * t; },
+  dist(x1, y1, x2, y2) { return Math.hypot(x2 - x1, y2 - y1); },
+  isEvenRow(row) { return row % 2 === 0; },
+  // Column count for a given row (odd rows have one fewer column, staggered right)
+  colsInRow(row) { return Utils.isEvenRow(row) ? CONFIG.COLS : CONFIG.COLS - 1; },
+  // Neighbor offsets depend on row parity (pointy-top staggered hex grid)
+  neighborOffsets(row) {
+    if (Utils.isEvenRow(row)) {
+      return [[-1, -1], [-1, 0], [0, -1], [0, 1], [1, -1], [1, 0]];
+    }
+    return [[-1, 0], [-1, 1], [0, -1], [0, 1], [1, 0], [1, 1]];
+  },
+  safeGet(obj, path, fallback) {
+    try {
+      if (obj === null || obj === undefined) return fallback;
+      return obj[path] !== undefined ? obj[path] : fallback;
+    } catch (e) { return fallback; }
+  }
+};
+
+/* ============================== SAVE MANAGER ============================= */
+const SaveManager = {
+  KEY: 'bubbleBurstSaga_save_v1',
+  defaults() {
+    return { unlockedLevel: 1, stars: {}, bestScore: {}, soundOn: true, musicOn: true };
+  },
+  load() {
+    let data;
+    try {
+      const raw = localStorage.getItem(this.KEY);
+      if (!raw) return this.defaults();
+      data = JSON.parse(raw);
+    } catch (e) {
+      console.warn('[Save] Corrupted save data, resetting to defaults.', e);
+      return this.defaults();
+    }
+    // Validate shape defensively; fall back to defaults for any bad field.
+    const d = this.defaults();
+    if (data && typeof data === 'object') {
+      if (Number.isInteger(data.unlockedLevel) && data.unlockedLevel >= 1) d.unlockedLevel = data.unlockedLevel;
+      if (data.stars && typeof data.stars === 'object') d.stars = data.stars;
+      if (data.bestScore && typeof data.bestScore === 'object') d.bestScore = data.bestScore;
+      if (typeof data.soundOn === 'boolean') d.soundOn = data.soundOn;
+      if (typeof data.musicOn === 'boolean') d.musicOn = data.musicOn;
+    }
+    return d;
+  },
+  save(data) {
+    try {
+      localStorage.setItem(this.KEY, JSON.stringify(data));
+      return true;
+    } catch (e) {
+      console.warn('[Save] Failed to persist save data.', e);
+      return false;
+    }
+  }
+};
+let GAME_SAVE = SaveManager.load();
+
+/* ============================== LEVEL DATA ================================
+   20 levels with progressively increasing difficulty. Each level defines:
+   - startRows: how many rows are pre-filled at the top
+   - colorCount: how many distinct bubble colors are in play (3-6)
+   - shots: number of shots the player gets
+   - targetScore: score needed to win
+   - pattern: which generator shapes the starting board
+   - seed: deterministic RNG seed so the level is the same every time
+   ============================================================================ */
+function seededRandom(seed) {
+  let s = seed % 2147483647;
+  if (s <= 0) s += 2147483646;
+  return function () {
+    s = (s * 16807) % 2147483647;
+    return (s - 1) / 2147483646;
+  };
+}
+
+function generateBoardPattern(pattern, rows, colorCount, rng) {
+  // Returns a 2D array [row][col] -> colorIndex or -1 (empty), sized to CONFIG.MAX_ROWS
+  const grid = [];
+  for (let r = 0; r < CONFIG.MAX_ROWS; r++) {
+    const cols = Utils.colsInRow(r);
+    const row = new Array(cols).fill(-1);
+    grid.push(row);
+  }
+  const pickColor = () => Math.floor(rng() * colorCount);
+
+  for (let r = 0; r < rows; r++) {
+    const cols = Utils.colsInRow(r);
+    for (let c = 0; c < cols; c++) {
+      let fill = true;
+      switch (pattern) {
+        case 'checker':
+          fill = (r + c) % 2 === 0;
+          break;
+        case 'pyramid':
+          fill = c >= Math.floor((cols - (r + 2)) / 2) && c < cols - Math.floor((cols - (r + 2)) / 2);
+          if (rows - r <= 1) fill = true;
+          break;
+        case 'diamond': {
+          const mid = (rows - 1) / 2;
+          const dist = Math.abs(r - mid);
+          fill = c >= Math.floor(dist) && c < cols - Math.floor(dist);
+          break;
+        }
+        case 'stripes':
+          fill = r % 3 !== 2;
+          break;
+        case 'holes':
+          fill = rng() > 0.15;
+          break;
+        case 'dense':
+        default:
+          fill = true;
+      }
+      if (fill) grid[r][c] = pickColor();
+    }
+  }
+  return grid;
+}
+
+const LEVEL_PATTERNS = ['dense', 'checker', 'pyramid', 'diamond', 'stripes', 'holes'];
+
+function buildLevels() {
+  const levels = [];
+  for (let i = 1; i <= 20; i++) {
+    const startRows = Utils.clamp(3 + Math.floor(i / 3), 3, 9);
+    const colorCount = Utils.clamp(3 + Math.floor(i / 5), 3, 6);
+    const shots = Utils.clamp(28 - Math.floor(i / 2), 16, 28);
+    const pattern = LEVEL_PATTERNS[i % LEVEL_PATTERNS.length];
+    const targetScore = 400 + i * 220 + startRows * 60;
+    levels.push({
+      id: i,
+      startRows,
+      colorCount,
+      shots,
+      targetScore,
+      pattern,
+      seed: i * 7919 + 13
+    });
+  }
+  return levels;
+}
+const LEVELS = buildLevels();
+function getLevel(id) {
+  if (!Number.isInteger(id) || id < 1 || id > LEVELS.length) {
+    console.warn('[Levels] Invalid level id requested:', id, '- falling back to level 1');
+    return LEVELS[0];
+  }
+  return LEVELS[id - 1];
+}
+
+/* ============================== AUDIO MANAGER =============================
+   All sound effects are synthesized at runtime via the Web Audio API, so
+   the game needs no external audio files. Respects sound/music toggles.
+   ============================================================================ */
+const AudioManager = {
+  ctx: null,
+  masterGain: null,   // SFX bus
+  soundOn: true,
+  musicOn: true, // preference is still stored/toggleable (no UI change), but no music system plays
+  init() {
+    this.soundOn = GAME_SAVE.soundOn !== false;
+    this.musicOn = GAME_SAVE.musicOn !== false;
+  },
+  ensureCtx() {
+    if (this.ctx) return this.ctx;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      this.ctx = new AC();
+      this.masterGain = this.ctx.createGain();
+      this.masterGain.gain.value = 0.5;
+      this.masterGain.connect(this.ctx.destination);
+    } catch (e) {
+      console.warn('[Audio] Could not create AudioContext.', e);
+      this.ctx = null;
+    }
+    return this.ctx;
+  },
+  resume() {
+    const ctx = this.ensureCtx();
+    if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {});
+  },
+  tone(freq, dur, type, gainVal, freqEnd) {
+    if (!this.soundOn) return;
+    const ctx = this.ensureCtx();
+    if (!ctx) return;
+    // Most mobile browsers start the AudioContext suspended until a user
+    // gesture unlocks it. Every sound call is itself triggered by a gesture
+    // (tap/click), so opportunistically resume here rather than relying on
+    // every call site to remember - this is what makes audio "just work"
+    // regardless of which screen/button the player interacts with first.
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    try {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = type || 'sine';
+      osc.frequency.setValueAtTime(freq, ctx.currentTime);
+      if (freqEnd) osc.frequency.exponentialRampToValueAtTime(Math.max(1, freqEnd), ctx.currentTime + dur);
+      gain.gain.setValueAtTime(gainVal || 0.3, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + dur);
+      osc.connect(gain);
+      gain.connect(this.masterGain);
+      osc.start();
+      osc.stop(ctx.currentTime + dur + 0.02);
+    } catch (e) { /* fail silently - audio is non-critical */ }
+  },
+  // Short haptic pulse(s), tied to the sound toggle so one setting controls
+  // all game feedback (no extra UI needed). Silently does nothing on
+  // desktop browsers / devices without vibration support.
+  vibrate(pattern) {
+    if (!this.soundOn) return;
+    try {
+      if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+        navigator.vibrate(pattern);
+      }
+    } catch (e) { /* vibration not supported/permitted - fail silently */ }
+  },
+  shoot() { this.tone(520, 0.09, 'triangle', 0.25, 780); this.vibrate(10); },
+  wallBounce() { this.tone(300, 0.06, 'square', 0.12, 200); },
+  attach() { this.tone(360, 0.07, 'sine', 0.18, 300); },
+  pop(comboIndex) {
+    const base = 440 + (comboIndex || 0) * 60;
+    this.tone(base, 0.12, 'sine', 0.28, base * 1.6);
+  },
+  // Called once per match event (not per bubble) so a big pop feels punchy
+  // instead of buzzing the phone once per bubble in the group.
+  matchFeedback(groupSize, isCombo) {
+    if (isCombo) {
+      this.tone(880, 0.08, 'triangle', 0.22, 1180);
+      setTimeout(() => this.tone(1180, 0.1, 'triangle', 0.2, 1480), 70);
+      this.vibrate([16, 30, 18]);
+    } else {
+      this.vibrate(14);
+    }
+  },
+  fall() { this.tone(200, 0.18, 'sawtooth', 0.12, 90); },
+  button() { this.tone(600, 0.05, 'square', 0.15, 700); },
+  win() {
+    if (!this.soundOn) return;
+    [523, 659, 784, 1046].forEach((f, i) => {
+      setTimeout(() => this.tone(f, 0.25, 'sine', 0.25), i * 110);
+    });
+    this.vibrate([30, 50, 30, 50, 70]);
+  },
+  lose() { this.tone(220, 0.4, 'sawtooth', 0.2, 90); },
+  setSoundOn(v) { this.soundOn = v; GAME_SAVE.soundOn = v; SaveManager.save(GAME_SAVE); },
+  // No background music system exists anymore - this just persists the
+  // preference so the existing Music toggle in Settings/Pause still works
+  // without changing any UI.
+  setMusicOn(v) { this.musicOn = v; GAME_SAVE.musicOn = v; SaveManager.save(GAME_SAVE); }
+};
+AudioManager.init();
+
+/* ============================== AD HOOKS (NOT WIRED TO ANY UI) =============
+   No ads are shown anywhere in this build. This module exists purely as a
+   clean seam for a future ad integration (e.g. a rewarded-video SDK) to
+   plug into without touching gameplay code. Every method is a documented
+   no-op today; wiring a real SDK later means filling these in, not
+   rewriting the call sites below.
+   ============================================================================ */
+const AdHooks = {
+  // Natural break point after a level is won - a real integration might show
+  // an interstitial here occasionally (e.g. every N levels).
+  onLevelComplete(levelId, score) {
+    // no-op placeholder
+  },
+  // Natural break point after a loss - a real integration might offer a
+  // rewarded-video "continue with 3 extra shots" here.
+  onGameOver(levelId, score) {
+    // no-op placeholder
+  },
+  // A real integration would show a rewarded-video ad and invoke onReward()
+  // only if the player watched it to completion. Since no ad SDK is wired
+  // up, this immediately reports "not available" so callers can't rely on
+  // a reward that will never come.
+  requestRewardedContinue(onReward, onUnavailable) {
+    if (typeof onUnavailable === 'function') onUnavailable();
+  }
+};
+
+/* ============================== ASSET FACTORY =============================
+   All visual assets are generated procedurally on Canvas at boot time
+   (real gradients + highlights for a glossy 3D look), then registered as
+   Phaser textures. No external image files are required.
+   ============================================================================ */
+function hexToRgb(hex) {
+  return { r: (hex >> 16) & 0xff, g: (hex >> 8) & 0xff, b: hex & 0xff };
+}
+function hexToRgba(hex, a) {
+  const c = hexToRgb(hex);
+  return `rgba(${c.r},${c.g},${c.b},${a})`;
+}
+function darkenHex(hex, amt) {
+  const c = hexToRgb(hex);
+  const f = 1 - (amt === undefined ? 0.35 : amt);
+  return `rgb(${Math.round(c.r * f)},${Math.round(c.g * f)},${Math.round(c.b * f)})`;
+}
+
+function shadeToRgba(hex, darkenAmt, alpha) {
+  const c = hexToRgb(hex);
+  const f = 1 - darkenAmt;
+  return `rgba(${Math.round(c.r * f)},${Math.round(c.g * f)},${Math.round(c.b * f)},${alpha})`;
+}
+
+function drawGlossyBubble(ctx, size, baseHex, lightHex) {
+  const cx = size / 2, cy = size / 2;
+  const margin = size * 0.035; // reserved band for the soft outer glow, kept inside canvas bounds
+  const r = size / 2 - margin;
+  ctx.clearRect(0, 0, size, size);
+
+  // Soft outer glow - a gentle gradient falloff (no blur filter, so it stays crisp
+  // and cheap to render), tucked just inside the canvas edge so it never bleeds
+  // into neighboring bubbles in the packed hex grid.
+  const glow = ctx.createRadialGradient(cx, cy, r * 0.92, cx, cy, r + margin);
+  glow.addColorStop(0, 'rgba(0,0,0,0)');
+  glow.addColorStop(0.65, hexToRgba(lightHex, 0.14));
+  glow.addColorStop(1, hexToRgba(lightHex, 0));
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r + margin, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.closePath();
+  ctx.clip(); // keep every shading pass crisply inside the sphere silhouette
+
+  // Main body: multi-stop gradient for a rounder, glassier falloff than a flat 3-stop blend.
+  const grad = ctx.createRadialGradient(cx - r * 0.35, cy - r * 0.42, r * 0.05, cx, cy, r * 1.05);
+  grad.addColorStop(0, hexToRgba(lightHex, 1));
+  grad.addColorStop(0.28, hexToRgba(lightHex, 0.82));
+  grad.addColorStop(0.58, hexToRgba(baseHex, 1));
+  grad.addColorStop(0.85, shadeToRgba(baseHex, 0.28, 1));
+  grad.addColorStop(1, shadeToRgba(baseHex, 0.5, 1));
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, size, size);
+
+  // Ambient bounce light along the bottom rim - subtle secondary reflection,
+  // like light bouncing back up off a surface below the sphere.
+  const bounce = ctx.createRadialGradient(cx, cy + r * 0.82, r * 0.05, cx, cy + r * 0.82, r * 0.85);
+  bounce.addColorStop(0, 'rgba(255,255,255,0.16)');
+  bounce.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = bounce;
+  ctx.fillRect(0, 0, size, size);
+
+  // Inner shadow crescent (lower-right) for volumetric depth, as if the light
+  // source is up-left and this side curves away from it.
+  ctx.beginPath();
+  ctx.ellipse(cx + r * 0.3, cy + r * 0.32, r * 0.78, r * 0.62, 0.5, 0, Math.PI * 2);
+  ctx.fillStyle = shadeToRgba(baseHex, 0.55, 0.3);
+  ctx.fill();
+
+  ctx.restore(); // drop the circular clip before drawing the rim stroke
+
+  // Crisp rim stroke - thickness scales with resolution so it stays clean at any texture size.
+  ctx.lineWidth = Math.max(2, size * 0.022);
+  ctx.strokeStyle = shadeToRgba(baseHex, 0.55, 1);
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Primary specular highlight: soft halo behind a bright core for a smoother,
+  // more realistic falloff than a single hard-edged ellipse.
+  ctx.beginPath();
+  ctx.ellipse(cx - r * 0.32, cy - r * 0.4, r * 0.42, r * 0.28, -0.5, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.28)';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(cx - r * 0.32, cy - r * 0.4, r * 0.25, r * 0.15, -0.5, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.88)';
+  ctx.fill();
+
+  // Secondary sparkle - small crisp reflection catch-light opposite the main highlight.
+  ctx.beginPath();
+  ctx.arc(cx + r * 0.32, cy + r * 0.38, r * 0.085, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.45)';
+  ctx.fill();
+}
+
+function drawBackground(ctx, w, h) {
+  // Deep navy/purple multi-stop gradient - darker and richer than a flat
+  // two-tone fill, while staying dark enough that colorful bubbles/HUD pop.
+  const grad = ctx.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, '#241f4d');
+  grad.addColorStop(0.35, '#171340');
+  grad.addColorStop(0.7, '#0d0b26');
+  grad.addColorStop(1, '#060512');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, w, h);
+
+  // Dedicated soft glow behind the bubble board's general area, so the
+  // play field itself reads as the visual focal point of the scene.
+  const boardGlow = ctx.createRadialGradient(w * 0.5, h * 0.42, 0, w * 0.5, h * 0.42, w * 0.68);
+  boardGlow.addColorStop(0, 'rgba(110,130,255,0.16)');
+  boardGlow.addColorStop(0.6, 'rgba(120,90,220,0.08)');
+  boardGlow.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = boardGlow;
+  ctx.beginPath();
+  ctx.arc(w * 0.5, h * 0.42, w * 0.68, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Secondary soft atmospheric glows for depth (kept subtle, off-center).
+  const glows = [
+    { x: w * 0.22, y: h * 0.15, r: w * 0.5, c: 'rgba(100,110,220,0.13)' },
+    { x: w * 0.82, y: h * 0.3, r: w * 0.46, c: 'rgba(170,100,230,0.1)' },
+    { x: w * 0.5, y: h * 0.86, r: w * 0.58, c: 'rgba(70,150,210,0.09)' }
+  ];
+  glows.forEach(g => {
+    const rg = ctx.createRadialGradient(g.x, g.y, 0, g.x, g.y, g.r);
+    rg.addColorStop(0, g.c);
+    rg.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = rg;
+    ctx.beginPath();
+    ctx.arc(g.x, g.y, g.r, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  // faint scattered stars
+  let seedRng = seededRandom(42);
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  for (let i = 0; i < 90; i++) {
+    const x = seedRng() * w, y = seedRng() * h, s = seedRng() * 2 + 0.4;
+    ctx.globalAlpha = seedRng() * 0.6 + 0.1;
+    ctx.beginPath();
+    ctx.arc(x, y, s, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // Subtle vignette for depth - keeps the edges a touch darker so the board
+  // and HUD read as the visual focus.
+  const vignette = ctx.createRadialGradient(w / 2, h * 0.45, h * 0.32, w / 2, h * 0.45, h * 0.76);
+  vignette.addColorStop(0, 'rgba(0,0,0,0)');
+  vignette.addColorStop(1, 'rgba(0,0,0,0.4)');
+  ctx.fillStyle = vignette;
+  ctx.fillRect(0, 0, w, h);
+}
+
+// A sparse, transparent-background star layer, oversized relative to the
+// screen so it can be nudged a few pixels for an ultra-slow parallax drift
+// without ever revealing an edge. Kept as a separate texture (rather than
+// baked into bg_main) specifically so it can move independently and cheaply.
+function drawStarsOverlay(ctx, w, h) {
+  ctx.clearRect(0, 0, w, h);
+  const rng = seededRandom(777);
+  for (let i = 0; i < 55; i++) {
+    const x = rng() * w, y = rng() * h, s = rng() * 1.6 + 0.5;
+    ctx.globalAlpha = rng() * 0.45 + 0.08;
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(x, y, s, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawShooterCannon(ctx, w, h) {
+  ctx.clearRect(0, 0, w, h);
+  const cx = w / 2;
+  // soft contact shadow grounding the base
+  const shadowGrad = ctx.createRadialGradient(cx, h - 30, 4, cx, h - 30, 100);
+  shadowGrad.addColorStop(0, 'rgba(0,0,0,0.4)');
+  shadowGrad.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = shadowGrad;
+  ctx.beginPath();
+  ctx.ellipse(cx, h - 30, 100, 46, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // barrel
+  const grad = ctx.createLinearGradient(cx - 40, 0, cx + 40, 0);
+  grad.addColorStop(0, '#5c6b8a');
+  grad.addColorStop(0.5, '#aab6d4');
+  grad.addColorStop(1, '#42506e');
+  ctx.fillStyle = grad;
+  roundRect(ctx, cx - 34, 10, 68, h - 60, 18);
+  ctx.fill();
+  ctx.strokeStyle = '#242c42';
+  ctx.lineWidth = 4;
+  roundRect(ctx, cx - 34, 10, 68, h - 60, 18);
+  ctx.stroke();
+  // base
+  const baseGrad = ctx.createRadialGradient(cx, h - 40, 10, cx, h - 40, 90);
+  baseGrad.addColorStop(0, '#7d8fc7');
+  baseGrad.addColorStop(1, '#2c3556');
+  ctx.fillStyle = baseGrad;
+  ctx.beginPath();
+  ctx.ellipse(cx, h - 40, 90, 42, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#1a2038';
+  ctx.lineWidth = 4;
+  ctx.stroke();
+  // subtle rim light along the top edge of the base
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.ellipse(cx, h - 40, 86, 38, 0, Math.PI * 1.05, Math.PI * 1.95);
+  ctx.stroke();
+  // trim highlight on barrel
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  roundRect(ctx, cx - 24, 16, 10, h - 90, 5);
+  ctx.fill();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawRoundedPanel(ctx, w, h, r, fill1, fill2, stroke) {
+  ctx.clearRect(0, 0, w, h);
+  // Soft drop shadow beneath the panel for lift/depth.
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.4)';
+  ctx.shadowBlur = 6;
+  ctx.shadowOffsetY = 3;
+  const grad = ctx.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, fill1);
+  grad.addColorStop(1, fill2);
+  ctx.fillStyle = grad;
+  roundRect(ctx, 4, 4, w - 8, h - 10, r);
+  ctx.fill();
+  ctx.restore();
+  // Crisp hairline border.
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = stroke;
+  roundRect(ctx, 4, 4, w - 8, h - 10, r);
+  ctx.stroke();
+  // Glossy top highlight strip for a premium, slightly glassy finish.
+  ctx.save();
+  roundRect(ctx, 4, 4, w - 8, h - 10, r);
+  ctx.clip();
+  const sheen = ctx.createLinearGradient(0, 4, 0, 4 + (h - 10) * 0.55);
+  sheen.addColorStop(0, 'rgba(255,255,255,0.22)');
+  sheen.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = sheen;
+  ctx.fillRect(4, 4, w - 8, (h - 10) * 0.55);
+  ctx.restore();
+}
+
+function drawHudBar(ctx, w, h) {
+  ctx.clearRect(0, 0, w, h);
+  const grad = ctx.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, '#1d2242');
+  grad.addColorStop(0.7, '#161a34');
+  grad.addColorStop(1, '#10132a');
+  ctx.fillStyle = grad;
+  // Gentle curved bottom edge instead of a hard rectangle cut.
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(w, 0);
+  ctx.lineTo(w, h - 36);
+  ctx.quadraticCurveTo(w / 2, h + 14, 0, h - 36);
+  ctx.closePath();
+  ctx.fill();
+  // Soft glow line along the bottom edge to separate the HUD from the board.
+  ctx.save();
+  ctx.globalAlpha = 0.5;
+  const edgeGrad = ctx.createLinearGradient(0, h - 40, 0, h);
+  edgeGrad.addColorStop(0, 'rgba(120,140,255,0)');
+  edgeGrad.addColorStop(1, 'rgba(120,140,255,0.35)');
+  ctx.fillStyle = edgeGrad;
+  ctx.fillRect(0, h - 40, w, 40);
+  ctx.restore();
+}
+
+function drawCircleButton(ctx, size, fill1, fill2, stroke) {
+  ctx.clearRect(0, 0, size, size);
+  const cx = size / 2, cy = size / 2, r = size / 2 - 6;
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.45)';
+  ctx.shadowBlur = 7;
+  ctx.shadowOffsetY = 3;
+  const grad = ctx.createRadialGradient(cx - r * 0.3, cy - r * 0.35, r * 0.1, cx, cy, r * 1.1);
+  grad.addColorStop(0, fill1);
+  grad.addColorStop(1, fill2);
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = stroke;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.stroke();
+  // top glass highlight
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  ctx.beginPath();
+  ctx.ellipse(cx, cy - r * 0.35, r * 0.75, r * 0.4, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawPreviewBadge(ctx, size) {
+  ctx.clearRect(0, 0, size, size);
+  const cx = size / 2, cy = size / 2, r = size / 2 - 6;
+  // Soft outer glow ring
+  const glow = ctx.createRadialGradient(cx, cy, r * 0.5, cx, cy, r * 1.15);
+  glow.addColorStop(0, 'rgba(159,176,232,0.22)');
+  glow.addColorStop(1, 'rgba(159,176,232,0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r * 1.15, 0, Math.PI * 2);
+  ctx.fill();
+  // Inset dark well so the bubble reads as "sitting inside" the badge
+  const wellGrad = ctx.createRadialGradient(cx, cy, r * 0.2, cx, cy, r);
+  wellGrad.addColorStop(0, 'rgba(10,13,28,0.85)');
+  wellGrad.addColorStop(1, 'rgba(20,24,48,0.55)');
+  ctx.fillStyle = wellGrad;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = 'rgba(159,176,232,0.55)';
+  ctx.stroke();
+}
+
+function drawGroundGlow(ctx, w, h) {
+  ctx.clearRect(0, 0, w, h);
+  const cx = w / 2, cy = h / 2;
+  const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, w / 2);
+  grad.addColorStop(0, 'rgba(110,140,255,0.28)');
+  grad.addColorStop(0.6, 'rgba(90,110,220,0.12)');
+  grad.addColorStop(1, 'rgba(90,110,220,0)');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, w / 2, h / 2, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawParticle(ctx, size, hex) {
+  ctx.clearRect(0, 0, size, size);
+  const cx = size / 2, cy = size / 2, r = size / 2 - 1;
+  const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+  grad.addColorStop(0, hexToRgba(hex, 1));
+  grad.addColorStop(1, hexToRgba(hex, 0));
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawStar(ctx, size, filled) {
+  ctx.clearRect(0, 0, size, size);
+  const cx = size / 2, cy = size / 2, spikes = 5, outerR = size * 0.46, innerR = size * 0.2;
+  ctx.beginPath();
+  for (let i = 0; i < spikes * 2; i++) {
+    const r = i % 2 === 0 ? outerR : innerR;
+    const a = (Math.PI / spikes) * i - Math.PI / 2;
+    const x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+  if (filled) {
+    const grad = ctx.createLinearGradient(0, 0, 0, size);
+    grad.addColorStop(0, '#ffe98a');
+    grad.addColorStop(1, '#f5a623');
+    ctx.fillStyle = grad;
+  } else {
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  }
+  ctx.fill();
+  ctx.strokeStyle = filled ? '#c97c0f' : 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+}
+
+function drawLock(ctx, size) {
+  ctx.clearRect(0, 0, size, size);
+  ctx.strokeStyle = '#dfe4f5';
+  ctx.fillStyle = '#dfe4f5';
+  ctx.lineWidth = size * 0.09;
+  const cx = size / 2, bodyW = size * 0.5, bodyH = size * 0.38, bodyY = size * 0.5;
+  ctx.beginPath();
+  ctx.arc(cx, size * 0.38, size * 0.2, Math.PI, 0, false);
+  ctx.stroke();
+  roundRect(ctx, cx - bodyW / 2, bodyY, bodyW, bodyH, 8);
+  ctx.fill();
+}
+
+function generateAllTextures(scene) {
+  const R = CONFIG.BUBBLE_RADIUS;
+  // Rendered at 2x the display resolution and then scaled down via setDisplaySize
+  // elsewhere - free anti-aliasing/supersampling for clean, smooth edges on
+  // high-DPI phone screens. Generated once at boot, so no runtime cost.
+  const BUBBLE_SS = 2;
+  const bSize = (R * 2 + 8) * BUBBLE_SS;
+  CONFIG.COLORS.forEach(c => {
+    const tex = scene.textures.createCanvas('bubble_' + c.key, bSize, bSize);
+    drawGlossyBubble(tex.getContext(), bSize, c.hex, c.light);
+    tex.refresh();
+  });
+  // dimmed preview version (next-bubble indicator uses same textures, smaller scale via display size)
+  const bg = scene.textures.createCanvas('bg_main', CONFIG.DESIGN_W, CONFIG.DESIGN_H);
+  drawBackground(bg.getContext(), CONFIG.DESIGN_W, CONFIG.DESIGN_H);
+  bg.refresh();
+
+  const starsOverlaySize = { w: CONFIG.DESIGN_W + 120, h: CONFIG.DESIGN_H + 120 };
+  const starsOverlay = scene.textures.createCanvas('bg_stars_parallax', starsOverlaySize.w, starsOverlaySize.h);
+  drawStarsOverlay(starsOverlay.getContext(), starsOverlaySize.w, starsOverlaySize.h);
+  starsOverlay.refresh();
+
+  const cannon = scene.textures.createCanvas('shooter_cannon', 180, 260);
+  drawShooterCannon(cannon.getContext(), 180, 260);
+  cannon.refresh();
+
+  const particle = scene.textures.createCanvas('particle_glow', 40, 40);
+  drawParticle(particle.getContext(), 40, 40, 0xffffff);
+  particle.refresh();
+
+  const starFilled = scene.textures.createCanvas('star_filled', 100, 100);
+  drawStar(starFilled.getContext(), 100, true);
+  starFilled.refresh();
+
+  const starEmpty = scene.textures.createCanvas('star_empty', 100, 100);
+  drawStar(starEmpty.getContext(), 100, false);
+  starEmpty.refresh();
+
+  const lock = scene.textures.createCanvas('lock_icon', 80, 80);
+  drawLock(lock.getContext(), 80);
+  lock.refresh();
+
+  // Button panels (a couple of sizes/styles reused across UI)
+  const btnPrimary = scene.textures.createCanvas('panel_primary', 560, 150);
+  drawRoundedPanel(btnPrimary.getContext(), 560, 150, 32, '#5b8def', '#3562c9', '#254a9e');
+  btnPrimary.refresh();
+
+  const btnSecondary = scene.textures.createCanvas('panel_secondary', 560, 150);
+  drawRoundedPanel(btnSecondary.getContext(), 560, 150, 32, '#3a4166', '#242a45', '#171b30');
+  btnSecondary.refresh();
+
+  const hudPanel = scene.textures.createCanvas('panel_hud', CONFIG.DESIGN_W, 220);
+  drawHudBar(hudPanel.getContext(), CONFIG.DESIGN_W, 220);
+  hudPanel.refresh();
+
+  const modalPanel = scene.textures.createCanvas('panel_modal', 860, 1000);
+  drawRoundedPanel(modalPanel.getContext(), 860, 1000, 40, '#262d52', '#171b33', '#4a5690');
+  modalPanel.refresh();
+
+  const btnCircle = scene.textures.createCanvas('btn_circle', 130, 130);
+  drawCircleButton(btnCircle.getContext(), 130, '#3a4166', '#20253f', '#4a5690');
+  btnCircle.refresh();
+
+  const btnCircleAccent = scene.textures.createCanvas('btn_circle_accent', 130, 130);
+  drawCircleButton(btnCircleAccent.getContext(), 130, '#ffe98a', '#f5a623', '#c97c0f');
+  btnCircleAccent.refresh();
+
+  const previewBadge = scene.textures.createCanvas('preview_badge', 150, 150);
+  drawPreviewBadge(previewBadge.getContext(), 150);
+  previewBadge.refresh();
+
+  const groundGlow = scene.textures.createCanvas('ground_glow', 420, 200);
+  drawGroundGlow(groundGlow.getContext(), 420, 200);
+  groundGlow.refresh();
+}
+
+/* ============================== BOARD SYSTEM ===============================
+   Owns the single authoritative grid data model (colorIndex per cell) and a
+   parallel sprite map. All grid math and neighbor lookups live here so
+   gameplay logic never touches Phaser objects directly for board state.
+   ============================================================================ */
+class BoardSystem {
+  constructor(scene) {
+    this.scene = scene;
+    this.data = [];   // data[row][col] = colorIndex (-1 = empty)
+    this.sprites = []; // sprites[row][col] = Phaser.GameObjects.Image | null
+    this.rowH = CONFIG.BUBBLE_RADIUS * Math.sqrt(3);
+    this.boardWidth = CONFIG.COLS * (CONFIG.BUBBLE_RADIUS * 2);
+    this.originX = (CONFIG.DESIGN_W - this.boardWidth) / 2 + CONFIG.BUBBLE_RADIUS;
+    this.originY = CONFIG.BOARD_TOP;
+    for (let r = 0; r < CONFIG.MAX_ROWS; r++) {
+      const cols = Utils.colsInRow(r);
+      this.data.push(new Array(cols).fill(-1));
+      this.sprites.push(new Array(cols).fill(null));
+    }
+  }
+
+  isValidCell(row, col) {
+    if (!Number.isInteger(row) || !Number.isInteger(col)) return false;
+    if (row < 0 || row >= CONFIG.MAX_ROWS) return false;
+    if (col < 0 || col >= Utils.colsInRow(row)) return false;
+    return true;
+  }
+
+  getColor(row, col) {
+    if (!this.isValidCell(row, col)) return -1;
+    return this.data[row][col];
+  }
+
+  cellToWorld(row, col) {
+    const rowOffset = Utils.isEvenRow(row) ? 0 : CONFIG.BUBBLE_RADIUS;
+    const x = this.originX + col * (CONFIG.BUBBLE_RADIUS * 2) + rowOffset;
+    const y = this.originY + row * this.rowH;
+    return { x, y };
+  }
+
+  // Find the nearest valid grid cell to a world point (used when a shot bubble lands)
+  worldToNearestCell(x, y) {
+    let best = null, bestD = Infinity;
+    const approxRow = Utils.clamp(Math.round((y - this.originY) / this.rowH), 0, CONFIG.MAX_ROWS - 1);
+    for (let r = Math.max(0, approxRow - 2); r <= Math.min(CONFIG.MAX_ROWS - 1, approxRow + 2); r++) {
+      const cols = Utils.colsInRow(r);
+      for (let c = 0; c < cols; c++) {
+        const p = this.cellToWorld(r, c);
+        const d = Utils.dist(x, y, p.x, p.y);
+        if (d < bestD) { bestD = d; best = { row: r, col: c }; }
+      }
+    }
+    return best;
+  }
+
+  getNeighbors(row, col) {
+    if (!this.isValidCell(row, col)) return [];
+    const offsets = Utils.neighborOffsets(row);
+    const result = [];
+    for (const [dr, dc] of offsets) {
+      const nr = row + dr, nc = col + dc;
+      if (this.isValidCell(nr, nc)) result.push({ row: nr, col: nc });
+    }
+    return result;
+  }
+
+  setBubble(row, col, colorIndex) {
+    if (!this.isValidCell(row, col)) {
+      console.warn('[Board] setBubble on invalid cell', row, col);
+      return false;
+    }
+    if (colorIndex < 0 || colorIndex >= CONFIG.COLORS.length) {
+      console.warn('[Board] Invalid colorIndex', colorIndex);
+      return false;
+    }
+    this.data[row][col] = colorIndex;
+    const colorDef = CONFIG.COLORS[colorIndex];
+    const pos = this.cellToWorld(row, col);
+    // Clean up any stale sprite occupying this cell before creating a new one
+    this.removeSprite(row, col);
+    const img = this.scene.add.image(pos.x, pos.y, 'bubble_' + colorDef.key);
+    img.setDisplaySize(CONFIG.BUBBLE_RADIUS * 2, CONFIG.BUBBLE_RADIUS * 2);
+    img.setDepth(10);
+    this.sprites[row][col] = img;
+    return true;
+  }
+
+  removeSprite(row, col) {
+    if (!this.isValidCell(row, col)) return;
+    const spr = this.sprites[row][col];
+    if (spr && spr.scene && !spr.destroyed && spr.active !== false) {
+      try { spr.destroy(); } catch (e) { /* already gone */ }
+    }
+    this.sprites[row][col] = null;
+  }
+
+  clearCell(row, col) {
+    if (!this.isValidCell(row, col)) return;
+    this.removeSprite(row, col);
+    this.data[row][col] = -1;
+  }
+
+  getSprite(row, col) {
+    if (!this.isValidCell(row, col)) return null;
+    return this.sprites[row][col];
+  }
+
+  // BFS group of same-colored connected bubbles starting from (row,col)
+  findMatchGroup(row, col) {
+    const color = this.getColor(row, col);
+    if (color < 0) return [];
+    const visited = new Set();
+    const stack = [{ row, col }];
+    const group = [];
+    visited.add(row + '_' + col);
+    while (stack.length) {
+      const cur = stack.pop();
+      group.push(cur);
+      const neighbors = this.getNeighbors(cur.row, cur.col);
+      for (const n of neighbors) {
+        const key = n.row + '_' + n.col;
+        if (visited.has(key)) continue;
+        if (this.getColor(n.row, n.col) === color) {
+          visited.add(key);
+          stack.push(n);
+        }
+      }
+    }
+    return group;
+  }
+
+  // Returns list of {row,col} bubbles not connected (directly/indirectly) to row 0
+  findFloatingBubbles() {
+    const anchored = new Set();
+    const queue = [];
+    const cols0 = Utils.colsInRow(0);
+    for (let c = 0; c < cols0; c++) {
+      if (this.getColor(0, c) >= 0) {
+        queue.push({ row: 0, col: c });
+        anchored.add('0_' + c);
+      }
+    }
+    let head = 0;
+    while (head < queue.length) {
+      const cur = queue[head++];
+      const neighbors = this.getNeighbors(cur.row, cur.col);
+      for (const n of neighbors) {
+        const key = n.row + '_' + n.col;
+        if (anchored.has(key)) continue;
+        if (this.getColor(n.row, n.col) >= 0) {
+          anchored.add(key);
+          queue.push(n);
+        }
+      }
+    }
+    const floating = [];
+    for (let r = 0; r < CONFIG.MAX_ROWS; r++) {
+      const cols = Utils.colsInRow(r);
+      for (let c = 0; c < cols; c++) {
+        if (this.getColor(r, c) >= 0 && !anchored.has(r + '_' + c)) {
+          floating.push({ row: r, col: c });
+        }
+      }
+    }
+    return floating;
+  }
+
+  lowestOccupiedRow() {
+    let lowest = -1;
+    for (let r = 0; r < CONFIG.MAX_ROWS; r++) {
+      const cols = Utils.colsInRow(r);
+      for (let c = 0; c < cols; c++) {
+        if (this.getColor(r, c) >= 0) lowest = r;
+      }
+    }
+    return lowest;
+  }
+
+  remainingBubbleCount() {
+    let n = 0;
+    for (let r = 0; r < CONFIG.MAX_ROWS; r++) {
+      const cols = Utils.colsInRow(r);
+      for (let c = 0; c < cols; c++) if (this.getColor(r, c) >= 0) n++;
+    }
+    return n;
+  }
+
+  loadPattern(grid) {
+    if (!Array.isArray(grid)) {
+      console.error('[Board] Invalid level pattern - expected array. Falling back to empty board.');
+      grid = [];
+    }
+    for (let r = 0; r < CONFIG.MAX_ROWS; r++) {
+      const cols = Utils.colsInRow(r);
+      for (let c = 0; c < cols; c++) {
+        this.clearCell(r, c);
+        const val = (grid[r] && Number.isInteger(grid[r][c])) ? grid[r][c] : -1;
+        if (val >= 0 && val < CONFIG.COLORS.length) {
+          this.setBubble(r, c, val);
+        }
+      }
+    }
+  }
+
+  destroyAll() {
+    for (let r = 0; r < CONFIG.MAX_ROWS; r++) {
+      const cols = Utils.colsInRow(r);
+      for (let c = 0; c < cols; c++) this.removeSprite(r, c);
+    }
+  }
+}
+
+/* ============================== BOOT / PRELOAD SCENES ===================== */
+class BootScene extends Phaser.Scene {
+  constructor() { super('Boot'); }
+  create() {
+    this.scale.refresh();
+    this.scene.start('Preload');
+  }
+}
+
+class PreloadScene extends Phaser.Scene {
+  constructor() { super('Preload'); }
+  create() {
+    const w = CONFIG.DESIGN_W, h = CONFIG.DESIGN_H;
+    this.cameras.main.setBackgroundColor('#0a0e1a');
+    const title = this.add.text(w / 2, h / 2 - 140, 'Bubble Burst Saga', {
+      fontFamily: 'Segoe UI, Arial', fontSize: '64px', color: '#ffffff', fontStyle: 'bold'
+    }).setOrigin(0.5);
+    title.setShadow(0, 4, 'rgba(0,0,0,0.5)', 8);
+
+    const barBg = this.add.graphics();
+    barBg.fillStyle(0x1c2340, 1);
+    barBg.fillRoundedRect(w / 2 - 260, h / 2, 520, 28, 14);
+    const barFg = this.add.graphics();
+    const pct = this.add.text(w / 2, h / 2 + 50, '0%', { fontFamily: 'Segoe UI, Arial', fontSize: '30px', color: '#9fb0e8' }).setOrigin(0.5);
+
+    const steps = [
+      'Mixing bubble gloss', 'Painting the shooter', 'Lighting the sky',
+      'Cutting star icons', 'Tuning sound effects', 'Polishing the UI'
+    ];
+    let i = 0;
+    const doStep = () => {
+      if (i === 0) {
+        try {
+          generateAllTextures(this);
+        } catch (e) {
+          console.error('[Preload] Asset generation failed:', e);
+        }
+      }
+      i++;
+      const progress = Utils.clamp(i / steps.length, 0, 1);
+      barFg.clear();
+      barFg.fillStyle(0x5b8def, 1);
+      barFg.fillRoundedRect(w / 2 - 260, h / 2, 520 * progress, 28, 14);
+      pct.setText(Math.round(progress * 100) + '%');
+      if (i < steps.length) {
+        this.time.delayedCall(90, doStep);
+      } else {
+        this.time.delayedCall(150, () => {
+          if (!this.textures.exists('bubble_red')) {
+            console.error('[Preload] Critical textures missing - cannot start game safely.');
+            pct.setText('Load error');
+            return;
+          }
+          this.scene.start('Menu');
+        });
+      }
+    };
+    doStep();
+  }
+}
+
+/* ============================== UI HELPERS ================================= */
+// Adds the base background plus a very slow-drifting star overlay on top for
+// an extremely subtle parallax effect. One lightweight tween per scene -
+// negligible cost, purely cosmetic, never affects layout or input.
+function addPremiumBackground(scene) {
+  const w = CONFIG.DESIGN_W, h = CONFIG.DESIGN_H;
+  scene.add.image(w / 2, h / 2, 'bg_main').setDisplaySize(w, h);
+  const stars = scene.add.image(w / 2, h / 2, 'bg_stars_parallax').setDisplaySize(w + 120, h + 120);
+  scene.tweens.add({
+    targets: stars, x: w / 2 + 22, y: h / 2 - 16,
+    duration: 48000, yoyo: true, repeat: -1, ease: 'Sine.easeInOut'
+  });
+  return stars;
+}
+
+function createButton(scene, x, y, w, h, texKey, label, fontSize, onClick) {
+  const container = scene.add.container(x, y);
+  const img = scene.add.image(0, 0, texKey);
+  img.setDisplaySize(w, h);
+  container.add(img);
+  if (label) {
+    const txt = scene.add.text(0, 0, label, {
+      fontFamily: 'Segoe UI, Arial', fontSize: (fontSize || 42) + 'px', color: '#ffffff', fontStyle: 'bold'
+    }).setOrigin(0.5);
+    txt.setShadow(0, 2, 'rgba(0,0,0,0.4)', 3);
+    container.add(txt);
+  }
+  container.setSize(w, h);
+  img.setInteractive({ useHandCursor: true });
+  let locked = false;
+  const doClick = () => {
+    if (locked) return; // guard against rapid double-taps / duplicate triggers
+    locked = true;
+    AudioManager.button();
+    scene.tweens.add({
+      targets: container, scaleX: 0.94, scaleY: 0.94, duration: 60, yoyo: true,
+      onComplete: () => { locked = false; }
+    });
+    if (typeof onClick === 'function') onClick();
+  };
+  img.on('pointerup', doClick);
+  container._destroyBtn = () => { if (img && img.active) img.removeAllListeners(); };
+  return container;
+}
+
+function createToggle(scene, x, y, label, initial, onChange) {
+  const container = scene.add.container(x, y);
+  const txt = scene.add.text(-190, 0, label, {
+    fontFamily: 'Segoe UI, Arial', fontSize: '34px', color: '#dfe4f5'
+  }).setOrigin(0, 0.5);
+  const track = scene.add.graphics();
+  const knob = scene.add.circle(0, 0, 26, 0xffffff);
+  let state = initial;
+  const redraw = () => {
+    track.clear();
+    track.fillStyle(state ? 0x3ecf6e : 0x3a4166, 1);
+    track.fillRoundedRect(140, -24, 100, 48, 24);
+    knob.x = state ? 140 + 74 : 140 + 26;
+    knob.y = 0;
+  };
+  redraw();
+  container.add([txt, track, knob]);
+  const hit = scene.add.zone(190, 0, 120, 60).setInteractive({ useHandCursor: true });
+  container.add(hit);
+  hit.on('pointerup', () => {
+    state = !state;
+    redraw();
+    AudioManager.button();
+    if (typeof onChange === 'function') onChange(state);
+  });
+  return container;
+}
+
+/* ============================== MENU SCENE ================================= */
+class MenuScene extends Phaser.Scene {
+  constructor() { super('Menu'); }
+  create() {
+    const w = CONFIG.DESIGN_W, h = CONFIG.DESIGN_H;
+    addPremiumBackground(this);
+
+    const title = this.add.text(w / 2, h * 0.22, 'Bubble Burst\nSaga', {
+      fontFamily: 'Segoe UI, Arial', fontSize: '92px', color: '#ffffff', fontStyle: 'bold', align: 'center'
+    }).setOrigin(0.5);
+    title.setShadow(0, 6, 'rgba(0,0,0,0.5)', 10);
+    this.tweens.add({ targets: title, y: title.y - 14, duration: 1600, yoyo: true, repeat: -1, ease: 'Sine.easeInOut' });
+
+    // decorative bubbles
+    const decoColors = ['red', 'blue', 'green', 'yellow', 'purple', 'orange'];
+    decoColors.forEach((c, i) => {
+      const bx = 130 + (i % 3) * (w - 260) / 2;
+      const by = h * 0.35 + Math.floor(i / 3) * 110;
+      const b = this.add.image(bx, by, 'bubble_' + c).setDisplaySize(70, 70).setAlpha(0.85);
+      this.tweens.add({ targets: b, y: by - 20, duration: 1400 + i * 120, yoyo: true, repeat: -1, ease: 'Sine.easeInOut', delay: i * 80 });
+    });
+
+    createButton(this, w / 2, h * 0.62, 480, 130, 'panel_primary', 'PLAY', 48, () => {
+      AudioManager.resume();
+      this.scene.start('LevelSelect');
+    });
+    createButton(this, w / 2, h * 0.73, 480, 130, 'panel_secondary', 'SETTINGS', 42, () => {
+      this.openSettings();
+    });
+
+    this.settingsOpen = false;
+  }
+
+  openSettings() {
+    if (this.settingsOpen) return;
+    this.settingsOpen = true;
+    const w = CONFIG.DESIGN_W, h = CONFIG.DESIGN_H;
+    const overlay = this.add.rectangle(w / 2, h / 2, w, h, 0x000000, 0.55).setInteractive();
+    const panel = this.add.image(w / 2, h / 2, 'panel_modal').setDisplaySize(760, 620);
+    const title = this.add.text(w / 2, h / 2 - 250, 'Settings', {
+      fontFamily: 'Segoe UI, Arial', fontSize: '52px', color: '#ffffff', fontStyle: 'bold'
+    }).setOrigin(0.5);
+    const soundToggle = createToggle(this, w / 2, h / 2 - 100, 'Sound Effects', AudioManager.soundOn, v => AudioManager.setSoundOn(v));
+    const musicToggle = createToggle(this, w / 2, h / 2 - 10, 'Music', AudioManager.musicOn, v => AudioManager.setMusicOn(v));
+    const closeBtn = createButton(this, w / 2, h / 2 + 220, 340, 110, 'panel_primary', 'CLOSE', 38, () => {
+      [overlay, panel, title, soundToggle, musicToggle, closeBtn].forEach(o => o && o.destroy());
+      this.settingsOpen = false;
+    });
+  }
+}
+
+/* ============================== LEVEL SELECT SCENE ========================= */
+class LevelSelectScene extends Phaser.Scene {
+  constructor() { super('LevelSelect'); }
+  create() {
+    GAME_SAVE = SaveManager.load(); // refresh in case updated elsewhere
+    const w = CONFIG.DESIGN_W, h = CONFIG.DESIGN_H;
+    addPremiumBackground(this);
+
+    this.add.text(w / 2, 110, 'Select Level', {
+      fontFamily: 'Segoe UI, Arial', fontSize: '58px', color: '#ffffff', fontStyle: 'bold'
+    }).setOrigin(0.5);
+
+    createButton(this, 110, 110, 140, 100, 'panel_secondary', '<', 44, () => {
+      this.scene.start('Menu');
+    });
+
+    // Scrollable level grid
+    const cols = 4;
+    const cellSize = 220;
+    const gridW = cols * cellSize;
+    const startX = w / 2 - gridW / 2 + cellSize / 2;
+    const startY = 260;
+    const rows = Math.ceil(LEVELS.length / cols);
+
+    const maskShape = this.make.graphics();
+    maskShape.fillStyle(0xffffff);
+    maskShape.fillRect(0, 230, w, h - 420);
+    const mask = maskShape.createGeometryMask();
+
+    const listContainer = this.add.container(0, 0);
+    listContainer.setMask(mask);
+
+    LEVELS.forEach((lvl, idx) => {
+      const col = idx % cols, row = Math.floor(idx / cols);
+      const x = startX + col * cellSize;
+      const y = startY + row * cellSize;
+      const unlocked = lvl.id <= GAME_SAVE.unlockedLevel;
+      const card = this.add.container(x, y);
+      const panel = this.add.image(0, 0, unlocked ? 'panel_primary' : 'panel_secondary');
+      panel.setDisplaySize(180, 180);
+      card.add(panel);
+      if (unlocked) {
+        const numText = this.add.text(0, -20, String(lvl.id), {
+          fontFamily: 'Segoe UI, Arial', fontSize: '54px', color: '#ffffff', fontStyle: 'bold'
+        }).setOrigin(0.5);
+        card.add(numText);
+        const starCount = Utils.safeGet(GAME_SAVE.stars, lvl.id, 0);
+        for (let s = 0; s < 3; s++) {
+          const st = this.add.image(-36 + s * 36, 46, s < starCount ? 'star_filled' : 'star_empty');
+          st.setDisplaySize(34, 34);
+          card.add(st);
+        }
+        panel.setInteractive({ useHandCursor: true });
+        panel.on('pointerup', () => {
+          AudioManager.button();
+          AudioManager.resume();
+          this.scene.start('Game', { levelId: lvl.id });
+        });
+      } else {
+        const lockImg = this.add.image(0, -6, 'lock_icon').setDisplaySize(60, 60);
+        card.add(lockImg);
+      }
+      listContainer.add(card);
+    });
+
+    // simple drag-to-scroll
+    const contentH = rows * cellSize + 60;
+    const viewH = h - 420;
+    const maxScroll = Math.max(0, contentH - viewH);
+    let dragStartY = null, startScroll = 0;
+    this.input.on('pointerdown', p => { dragStartY = p.y; startScroll = listContainer.y; });
+    this.input.on('pointermove', p => {
+      if (dragStartY === null || !p.isDown) return;
+      const dy = p.y - dragStartY;
+      listContainer.y = Utils.clamp(startScroll + dy, -maxScroll, 0);
+    });
+    this.input.on('pointerup', () => { dragStartY = null; });
+  }
+}
+
+/* ============================== GAME SCENE ================================= */
+class GameScene extends Phaser.Scene {
+  constructor() { super('Game'); }
+
+  init(data) {
+    this.levelId = (data && Number.isInteger(data.levelId)) ? data.levelId : 1;
+    this.isShooting = false;
+    this.isPaused = false;
+    this.isGameOver = false;
+    this.isAiming = false;
+    this.shotSprite = null;
+    this.shotVel = null;
+    this.shotColorIndex = -1;
+    this.score = 0;
+    this.aimDir = { x: 0, y: -1 };
+  }
+
+  create() {
+    const w = CONFIG.DESIGN_W, h = CONFIG.DESIGN_H;
+    this.level = getLevel(this.levelId);
+    if (!this.level) {
+      console.error('[Game] Could not resolve level - aborting scene start.');
+      this.scene.start('LevelSelect');
+      return;
+    }
+
+    addPremiumBackground(this);
+
+    this.board = new BoardSystem(this);
+    const rng = seededRandom(this.level.seed);
+    const pattern = generateBoardPattern(this.level.pattern, this.level.startRows, this.level.colorCount, rng);
+    this.board.loadPattern(pattern);
+
+    this.wallLeft = this.board.originX - CONFIG.BUBBLE_RADIUS;
+    this.wallRight = this.wallLeft + this.board.boardWidth;
+    this.ceilingY = this.board.originY - CONFIG.BUBBLE_RADIUS;
+
+    this.shotsRemaining = this.level.shots;
+    this.score = 0;
+
+    this.shooterX = w / 2;
+    this.shooterY = CONFIG.SHOOTER_Y;
+
+    this.currentColorIndex = this.pickRandomColor();
+    this.nextColorIndex = this.pickRandomColor();
+
+    // --- Shooter visuals ---
+    this.cannonBaseY = this.shooterY + 30;
+
+    // Soft ground-glow platform beneath the cannon for depth/grounding.
+    this.shooterGlow = this.add.image(this.shooterX, this.cannonBaseY + 70, 'ground_glow');
+    this.shooterGlow.setDisplaySize(520, 220);
+    this.shooterGlow.setDepth(18);
+
+    this.cannonImg = this.add.image(this.shooterX, this.cannonBaseY, 'shooter_cannon');
+    this.cannonImg.setDisplaySize(160, 230);
+    this.cannonImg.setDepth(20);
+    this.cannonRotation = 0;       // current smoothed rotation (radians, 0 = pointing straight up)
+    this.cannonTargetRotation = 0; // rotation we're easing toward
+
+    // Muzzle glow (small light at the barrel tip, brightens briefly on fire)
+    this.muzzleGlow = this.add.image(this.shooterX, this.shooterY - 90, 'particle_glow');
+    this.muzzleGlow.setDisplaySize(50, 50);
+    this.muzzleGlow.setDepth(19);
+    this.muzzleGlow.setAlpha(0);
+    this.muzzleGlow.setBlendMode(Phaser.BlendModes.ADD);
+
+    // Next-bubble preview: a glowing "well" badge with a clean NEXT pill label.
+    this.nextPreviewRing = this.add.image(this.shooterX + 195, this.shooterY + 55, 'preview_badge');
+    this.nextPreviewRing.setDisplaySize(130, 130);
+    this.nextPreviewRing.setDepth(20);
+    this.nextLabelPill = this.add.graphics().setDepth(21);
+    this.nextLabelPill.fillStyle(0x2c3358, 0.9);
+    this.nextLabelPill.fillRoundedRect(this.shooterX + 195 - 54, this.shooterY - 26, 108, 34, 17);
+    this.nextLabelPill.lineStyle(2, 0x4a5690, 0.8);
+    this.nextLabelPill.strokeRoundedRect(this.shooterX + 195 - 54, this.shooterY - 26, 108, 34, 17);
+    this.nextPreviewLabel = this.add.text(this.shooterX + 195, this.shooterY - 9, 'NEXT', {
+      fontFamily: 'Segoe UI, Arial', fontSize: '20px', color: '#c3cdf0', fontStyle: 'bold'
+    }).setOrigin(0.5).setDepth(22);
+
+    this.currentBubbleSprite = null;
+    this.nextBubbleSprite = null;
+    this.refreshQueueSprites(false);
+
+    this.aimGraphics = this.add.graphics();
+    this.aimGraphics.setDepth(15);
+    this.aimReticle = this.add.image(0, 0, 'bubble_red'); // recolored per-shot; hidden until aiming
+    this.aimReticle.setDepth(16).setAlpha(0).setDisplaySize(CONFIG.BUBBLE_RADIUS * 1.7, CONFIG.BUBBLE_RADIUS * 1.7);
+    this.comboStreak = 0;
+    this.comboResetTimer = null;
+
+    // --- HUD ---
+    this.buildHUD();
+
+    // --- Input ---
+    this.input.on('pointerdown', this.onPointerDown, this);
+    this.input.on('pointermove', this.onPointerMove, this);
+    this.input.on('pointerup', this.onPointerUp, this);
+    this.input.on('pointerupoutside', this.onPointerUp, this);
+
+    // --- overlay containers, built lazily ---
+    this.pauseOverlay = null;
+    this.endOverlay = null;
+
+    // --- cleanup on shutdown: stop timers/tweens, remove listeners, free board sprites ---
+    this.events.once('shutdown', this.cleanupScene, this);
+    this.events.once('destroy', this.cleanupScene, this);
+  }
+
+  cleanupScene() {
+    try {
+      this.input.off('pointerdown', this.onPointerDown, this);
+      this.input.off('pointermove', this.onPointerMove, this);
+      this.input.off('pointerup', this.onPointerUp, this);
+      this.input.off('pointerupoutside', this.onPointerUp, this);
+      this.tweens.killAll();
+      this.time.removeAllEvents();
+      if (this.board) this.board.destroyAll();
+    } catch (e) {
+      console.warn('[Game] Cleanup encountered an issue (non-fatal):', e);
+    }
+  }
+
+  pickRandomColor() {
+    const count = Utils.clamp(this.level.colorCount, 1, CONFIG.COLORS.length);
+    if (this.board) {
+      const present = new Set();
+      for (let r = 0; r < CONFIG.MAX_ROWS; r++) {
+        const cols = Utils.colsInRow(r);
+        for (let c = 0; c < cols; c++) {
+          const col = this.board.getColor(r, c);
+          if (col >= 0) present.add(col);
+        }
+      }
+      if (present.size > 0) {
+        const arr = Array.from(present);
+        return arr[Math.floor(Math.random() * arr.length)];
+      }
+    }
+    return Math.floor(Math.random() * count);
+  }
+
+  refreshQueueSprites(animate) {
+    if (this.currentBubbleSprite && this.currentBubbleSprite.active) this.currentBubbleSprite.destroy();
+    if (this.nextBubbleSprite && this.nextBubbleSprite.active) this.nextBubbleSprite.destroy();
+    const curKey = 'bubble_' + CONFIG.COLORS[this.currentColorIndex].key;
+    const nextKey = 'bubble_' + CONFIG.COLORS[this.nextColorIndex].key;
+    const fullSize = CONFIG.BUBBLE_RADIUS * 2;
+    const nextSize = CONFIG.BUBBLE_RADIUS * 1.1;
+
+    this.currentBubbleSprite = this.add.image(this.shooterX, this.shooterY, curKey);
+    this.currentBubbleSprite.setDepth(21);
+    this.nextBubbleSprite = this.add.image(this.shooterX + 195, this.shooterY + 55, nextKey);
+    this.nextBubbleSprite.setDepth(21);
+    this.nextBubbleSprite.setAlpha(0.95);
+
+    if (animate) {
+      // Bubble hops into place with a light squash-and-settle instead of popping in flat-footed.
+      this.currentBubbleSprite.setDisplaySize(fullSize * 0.5, fullSize * 0.5);
+      this.currentBubbleSprite.setAlpha(0.4);
+      this.tweens.add({
+        targets: this.currentBubbleSprite, alpha: 1, duration: 160, ease: 'Cubic.easeOut'
+      });
+      this.tweens.add({
+        targets: this.currentBubbleSprite, displayWidth: fullSize, displayHeight: fullSize,
+        duration: 220, ease: 'Back.easeOut'
+      });
+      this.nextBubbleSprite.setDisplaySize(nextSize * 0.5, nextSize * 0.5);
+      this.tweens.add({
+        targets: this.nextBubbleSprite, displayWidth: nextSize, displayHeight: nextSize,
+        duration: 220, delay: 60, ease: 'Back.easeOut'
+      });
+    } else {
+      this.currentBubbleSprite.setDisplaySize(fullSize, fullSize);
+      this.nextBubbleSprite.setDisplaySize(nextSize, nextSize);
+    }
+  }
+
+  buildHUD() {
+    const w = CONFIG.DESIGN_W;
+    this.hudPanel = this.add.image(w / 2, 100, 'panel_hud').setDisplaySize(w, 200).setDepth(30);
+
+    // --- Level pill (top-left) ---
+    const pillW = 168, pillH = 44, pillX = 40, pillY = 20;
+    this.levelPill = this.add.graphics().setDepth(31);
+    this.levelPill.fillStyle(0x2c3358, 0.85);
+    this.levelPill.fillRoundedRect(pillX, pillY, pillW, pillH, pillH / 2);
+    this.levelPill.lineStyle(2, 0x5b8def, 0.6);
+    this.levelPill.strokeRoundedRect(pillX, pillY, pillW, pillH, pillH / 2);
+    this.levelText = this.add.text(pillX + pillW / 2, pillY + pillH / 2, 'LEVEL ' + this.level.id, {
+      fontFamily: 'Segoe UI, Arial', fontSize: '26px', color: '#c3cdf0', fontStyle: 'bold'
+    }).setOrigin(0.5).setDepth(32);
+
+    // --- Score (label + big value), typography hierarchy: small caps label, large bold number ---
+    this.scoreLabel = this.add.text(pillX + 2, 86, 'SCORE', {
+      fontFamily: 'Segoe UI, Arial', fontSize: '22px', color: '#7c8ac0', fontStyle: 'bold'
+    }).setDepth(31);
+    this.scoreText = this.add.text(pillX, 112, '0', {
+      fontFamily: 'Segoe UI, Arial', fontSize: '54px', color: '#ffffff', fontStyle: 'bold'
+    }).setDepth(31);
+    this.scoreText.setShadow(0, 2, 'rgba(0,0,0,0.4)', 4);
+
+    // --- Score progress bar (visual polish only - shows score vs. target) ---
+    const barX = pillX, barY = 178, barW = 480, barH = 14;
+    this.scoreBarTrack = this.add.graphics().setDepth(31);
+    this.scoreBarTrack.fillStyle(0x151a34, 0.9);
+    this.scoreBarTrack.fillRoundedRect(barX, barY, barW, barH, barH / 2);
+    this.scoreBarTrack.lineStyle(2, 0x2c3358, 1);
+    this.scoreBarTrack.strokeRoundedRect(barX, barY, barW, barH, barH / 2);
+    this.scoreBarWidth = barW;
+    this.scoreBarFill = this.add.rectangle(barX + barH / 2, barY + barH / 2, 1, barH - 4, 0x5b8def)
+      .setOrigin(0, 0.5).setDepth(32);
+    this.scoreBarLabel = this.add.text(barX + barW, barY + barH / 2, '/ ' + this.level.targetScore, {
+      fontFamily: 'Segoe UI, Arial', fontSize: '22px', color: '#7c8ac0', fontStyle: 'bold'
+    }).setOrigin(1, 0.5).setDepth(31);
+    // move the target number just above the right end of the bar for a cleaner read
+    this.scoreBarLabel.setPosition(barX + barW, barY - 16);
+    this.scoreBarLabel.setOrigin(1, 1);
+
+    // --- Shots remaining badge (top-right, circular accent badge) ---
+    const shotsCX = w - 100, shotsCY = 82;
+    this.shotsBadge = this.add.image(shotsCX, shotsCY, 'btn_circle_accent').setDisplaySize(104, 104).setDepth(31);
+    this.shotsText = this.add.text(shotsCX, shotsCY - 6, String(this.shotsRemaining), {
+      fontFamily: 'Segoe UI, Arial', fontSize: '40px', color: '#2a1a08', fontStyle: 'bold'
+    }).setOrigin(0.5).setDepth(32);
+    this.shotsSubText = this.add.text(shotsCX, shotsCY, 'SHOTS', {
+      fontFamily: 'Segoe UI, Arial', fontSize: '15px', color: '#4a2f0c', fontStyle: 'bold'
+    }).setOrigin(0.5, -1.15).setDepth(32);
+
+    // --- Pause button (circular icon button, drawn crisp with Graphics bars) ---
+    const pauseCX = w - 100, pauseCY = 195;
+    this.pauseBtn = createButton(this, pauseCX, pauseCY, 92, 92, 'btn_circle', '', 0, () => {
+      this.openPause();
+    });
+    this.pauseBtn.setDepth(31);
+    const pauseIcon = this.add.graphics().setDepth(32);
+    pauseIcon.fillStyle(0xe8ecfb, 1);
+    pauseIcon.fillRoundedRect(-16, -18, 12, 36, 3);
+    pauseIcon.fillRoundedRect(4, -18, 12, 36, 3);
+    this.pauseBtn.add(pauseIcon);
+
+    this.updateHUD(); // sync bar/text with initial score & shots state
+  }
+
+  updateHUD() {
+    if (this.scoreText) this.scoreText.setText(String(this.score));
+    if (this.shotsText) this.shotsText.setText(String(Math.max(0, this.shotsRemaining)));
+    if (this.scoreBarFill && this.level && this.level.targetScore > 0) {
+      const ratio = Utils.clamp(this.score / this.level.targetScore, 0, 1);
+      const barH = this.scoreBarFill.height;
+      this.scoreBarFill.setSize(Math.max(1, this.scoreBarWidth * ratio), barH);
+    }
+  }
+
+  // Pure score bookkeeping - updates the running total and HUD text only.
+  // Visual feedback is handled separately by showScorePopup() so combo/streak
+  // juice can be layered on without duplicating the scorekeeping logic.
+  addScoreValue(amount) {
+    this.score += amount;
+    this.updateHUD();
+  }
+
+  // Score popup with combo-aware juice: bigger pop-in scale, brighter color,
+  // and a "COMBO xN" callout when the player is chaining matches quickly.
+  showScorePopup(amount, big) {
+    this.addScoreValue(amount);
+    const streak = this.comboStreak || 0;
+    const color = big ? '#ff8c42' : '#ffe98a';
+    const fontSize = big ? 56 : 40;
+
+    const popup = this.add.text(this.shooterX, this.shooterY - 120, '+' + amount, {
+      fontFamily: 'Segoe UI, Arial', fontSize: fontSize + 'px', color, fontStyle: 'bold'
+    }).setOrigin(0.5).setDepth(50);
+    popup.setScale(big ? 0.4 : 0.7);
+    this.tweens.add({
+      targets: popup, scale: 1, duration: 140, ease: 'Back.easeOut'
+    });
+    this.tweens.add({
+      targets: popup, y: popup.y - (big ? 130 : 80), alpha: 0, duration: 750, delay: 140, ease: 'Cubic.easeOut',
+      onComplete: () => { if (popup && popup.active) popup.destroy(); }
+    });
+
+    if (streak >= 2) {
+      const comboText = this.add.text(this.shooterX, this.shooterY - 190, 'COMBO x' + streak + '!', {
+        fontFamily: 'Segoe UI, Arial', fontSize: '44px', color: '#ff5d7a', fontStyle: 'bold'
+      }).setOrigin(0.5).setDepth(51);
+      comboText.setScale(0);
+      this.tweens.add({
+        targets: comboText, scale: 1, duration: 160, ease: 'Back.easeOut',
+        onComplete: () => {
+          this.tweens.add({
+            targets: comboText, y: comboText.y - 60, alpha: 0, duration: 500, delay: 250, ease: 'Cubic.easeOut',
+            onComplete: () => { if (comboText && comboText.active) comboText.destroy(); }
+          });
+        }
+      });
+    }
+  }
+
+  /* ---------------------------- AIMING / INPUT ---------------------------- */
+  onPointerDown(pointer) {
+    if (this.isPaused || this.isGameOver || this.isShooting) return;
+    // Full-screen drag-to-aim: touch anywhere (board, empty space, near the
+    // shooter) and start aiming immediately - more forgiving on mobile than
+    // requiring a precise tap near the cannon.
+    this.isAiming = true;
+    this.updateAim(pointer);
+  }
+
+  onPointerMove(pointer) {
+    if (!this.isAiming) return;
+    if (this.isPaused || this.isGameOver || this.isShooting) { this.cancelAim(); return; }
+    this.updateAim(pointer);
+  }
+
+  onPointerUp(pointer) {
+    if (!this.isAiming) return;
+    this.isAiming = false;
+    this.hideAimVisuals();
+    if (this.isPaused || this.isGameOver || this.isShooting) return;
+    this.shootBubble();
+  }
+
+  cancelAim() {
+    this.isAiming = false;
+    this.hideAimVisuals();
+  }
+
+  hideAimVisuals() {
+    this.aimGraphics.clear();
+    if (this.aimReticle) this.aimReticle.setAlpha(0);
+    this.cannonTargetRotation = 0; // relax back to pointing straight up
+  }
+
+  computeClampedAimDir(pointerX, pointerY) {
+    let dx = pointerX - this.shooterX;
+    let dy = pointerY - this.shooterY;
+    if (dy > -60) dy = -60; // never allow downward or near-horizontal shots
+    let angle = Math.atan2(dy, dx);
+    const minA = Phaser.Math.DegToRad(-169);
+    const maxA = Phaser.Math.DegToRad(-11);
+    angle = Utils.clamp(angle, minA, maxA);
+    return { x: Math.cos(angle), y: Math.sin(angle) };
+  }
+
+  updateAim(pointer) {
+    this.aimDir = this.computeClampedAimDir(pointer.x, pointer.y);
+    // Barrel image points "up" at rotation 0, so offset by 90deg to align with aimDir.
+    this.cannonTargetRotation = Math.atan2(this.aimDir.y, this.aimDir.x) + Math.PI / 2;
+
+    const path = this.simulateTrajectory(this.shooterX, this.shooterY, this.aimDir.x, this.aimDir.y);
+    this.aimGraphics.clear();
+
+    const colorHex = CONFIG.COLORS[this.currentColorIndex].hex;
+    // Soft glowing guide line beneath the dashes for a more premium look.
+    this.aimGraphics.lineStyle(10, colorHex, 0.12);
+    this.aimGraphics.beginPath();
+    this.aimGraphics.moveTo(this.shooterX, this.shooterY);
+    path.points.forEach(p => this.aimGraphics.lineTo(p.x, p.y));
+    this.aimGraphics.strokePath();
+
+    // Dashed dot trail, shrinking and fading with distance.
+    path.points.forEach((p, i) => {
+      if (i % 3 !== 0) return;
+      const t = i / Math.max(1, path.points.length);
+      const alpha = Utils.clamp(1 - t, 0.18, 0.95);
+      const size = Utils.clamp(9 - t * 5, 3.5, 9);
+      this.aimGraphics.fillStyle(0xffffff, alpha);
+      this.aimGraphics.fillCircle(p.x, p.y, size);
+    });
+
+    if (path.landing) {
+      // Pulsing landing reticle tinted to match the bubble about to be fired.
+      this.aimGraphics.lineStyle(4, colorHex, 0.85);
+      this.aimGraphics.strokeCircle(path.landing.x, path.landing.y, CONFIG.BUBBLE_RADIUS * 0.95);
+      this.aimGraphics.lineStyle(2, 0xffffff, 0.5);
+      this.aimGraphics.strokeCircle(path.landing.x, path.landing.y, CONFIG.BUBBLE_RADIUS * 0.65);
+      if (this.aimReticle) {
+        this.aimReticle.setPosition(path.landing.x, path.landing.y);
+        this.aimReticle.setTint(colorHex);
+        this.aimReticle.setAlpha(0.35);
+      }
+    } else if (this.aimReticle) {
+      this.aimReticle.setAlpha(0);
+    }
+  }
+
+  // Shared trajectory simulation used for BOTH the aim preview and the real
+  // shot, so the visual guide always matches actual shooting behavior.
+  simulateTrajectory(startX, startY, dirX, dirY) {
+    const R = CONFIG.BUBBLE_RADIUS;
+    let x = startX, y = startY, vx = dirX, vy = dirY;
+    const points = [];
+    const stepSize = 14;
+    const maxSteps = 900;
+    let landing = null;
+    for (let i = 0; i < maxSteps; i++) {
+      x += vx * stepSize;
+      y += vy * stepSize;
+      if (x <= this.wallLeft) { x = this.wallLeft; vx *= -1; }
+      if (x >= this.wallRight) { x = this.wallRight; vx *= -1; }
+      points.push({ x, y });
+      if (y - R <= this.ceilingY) { landing = { x, y }; break; }
+      const hit = this.findCollisionCellAt(x, y);
+      if (hit) { landing = { x, y, cell: hit }; break; }
+      if (points.length > 260) break; // safety cap on preview length
+    }
+    return { points, landing };
+  }
+
+  findCollisionCellAt(x, y) {
+    if (!this.board) return null;
+    const approxRow = Utils.clamp(Math.round((y - this.board.originY) / this.board.rowH), 0, CONFIG.MAX_ROWS - 1);
+    for (let r = Math.max(0, approxRow - 2); r <= Math.min(CONFIG.MAX_ROWS - 1, approxRow + 2); r++) {
+      const cols = Utils.colsInRow(r);
+      for (let c = 0; c < cols; c++) {
+        if (this.board.getColor(r, c) < 0) continue;
+        const p = this.board.cellToWorld(r, c);
+        if (Utils.dist(x, y, p.x, p.y) < CONFIG.BUBBLE_RADIUS * 1.92) {
+          return { row: r, col: c };
+        }
+      }
+    }
+    return null;
+  }
+
+  /* ---------------------------- SHOOTING ----------------------------------- */
+  shootBubble() {
+    if (this.isShooting || this.isPaused || this.isGameOver) return; // prevent multiple simultaneous shots
+    if (!this.currentBubbleSprite || !this.currentBubbleSprite.active) {
+      console.warn('[Game] No current bubble to shoot - refreshing queue defensively.');
+      this.refreshQueueSprites();
+      return;
+    }
+    this.isShooting = true;
+    this.shotColorIndex = this.currentColorIndex;
+    this.shotSprite = this.currentBubbleSprite;
+    this.currentBubbleSprite = null;
+    this.shotVel = { x: this.aimDir.x, y: this.aimDir.y };
+    AudioManager.shoot();
+    this.playCannonRecoil();
+    this.playMuzzleFlash();
+
+    // Quick launch squash-and-stretch on the bubble itself for extra punch.
+    const stretchX = 1 + Math.abs(this.aimDir.y) * 0.28;
+    const stretchY = 1 - Math.abs(this.aimDir.y) * 0.18;
+    this.shotSprite.setDisplaySize(CONFIG.BUBBLE_RADIUS * 2 * stretchX, CONFIG.BUBBLE_RADIUS * 2 * stretchY);
+    this.tweens.add({
+      targets: this.shotSprite,
+      displayWidth: CONFIG.BUBBLE_RADIUS * 2, displayHeight: CONFIG.BUBBLE_RADIUS * 2,
+      duration: 140, ease: 'Cubic.easeOut'
+    });
+  }
+
+  playCannonRecoil() {
+    if (!this.cannonImg || !this.cannonImg.active) return;
+    this.tweens.killTweensOf(this.cannonImg); // avoid stacking recoils on rapid-fire taps
+    const kickX = Math.sin(this.cannonRotation) * -14;
+    const kickY = Math.cos(this.cannonRotation) * 14;
+    this.cannonImg.x = this.shooterX + kickX;
+    this.cannonImg.y = this.cannonBaseY + kickY;
+    this.cannonImg.scaleY *= 0.9;
+    this.tweens.add({
+      targets: this.cannonImg,
+      x: this.shooterX, y: this.cannonBaseY, duration: 160, ease: 'Back.easeOut'
+    });
+    this.tweens.add({
+      targets: this.cannonImg,
+      scaleY: this.cannonImg.scaleY / 0.9, duration: 160, ease: 'Back.easeOut'
+    });
+  }
+
+  playMuzzleFlash() {
+    if (!this.muzzleGlow || !this.muzzleGlow.active) return;
+    const tipDist = 150;
+    this.muzzleGlow.setPosition(
+      this.shooterX + this.aimDir.x * tipDist,
+      this.shooterY - 20 + this.aimDir.y * tipDist
+    );
+    this.muzzleGlow.setTint(CONFIG.COLORS[this.shotColorIndex].hex);
+    this.muzzleGlow.setAlpha(0.85);
+    this.muzzleGlow.setDisplaySize(70, 70);
+  }
+
+  update(time, delta) {
+    // Smoothly ease the cannon toward its aim/rest rotation every frame instead
+    // of snapping, which reads as far more premium on a touch drag.
+    if (this.cannonImg && this.cannonImg.active) {
+      const lerpFactor = Utils.clamp(delta / 90, 0, 1);
+      this.cannonRotation = Phaser.Math.Linear(this.cannonRotation, this.cannonTargetRotation, lerpFactor);
+      this.cannonImg.setRotation(this.cannonRotation);
+    }
+    if (this.muzzleGlow && this.muzzleGlow.active && this.muzzleGlow.alpha > 0) {
+      this.muzzleGlow.setAlpha(Math.max(0, this.muzzleGlow.alpha - delta / 220));
+    }
+    if (this.isShooting && this.shotSprite && this.shotSprite.active) {
+      this.advanceShot(delta);
+    }
+  }
+
+  advanceShot(delta) {
+    const R = CONFIG.BUBBLE_RADIUS;
+    const dtSec = Math.min(delta, 40) / 1000; // clamp delta to avoid huge jumps on tab-switch lag
+    let remaining = CONFIG.SHOT_SPEED * dtSec;
+    const stepSize = R * 0.4;
+    const substeps = Math.max(1, Math.ceil(remaining / stepSize));
+    const step = remaining / substeps;
+
+    for (let i = 0; i < substeps; i++) {
+      if (!this.shotSprite || !this.shotSprite.active) return; // sprite could be destroyed mid-loop; bail safely
+      this.shotSprite.x += this.shotVel.x * step;
+      this.shotSprite.y += this.shotVel.y * step;
+
+      if (this.shotSprite.x <= this.wallLeft) { this.shotSprite.x = this.wallLeft; this.shotVel.x *= -1; this.playWallBounceFeedback(); }
+      if (this.shotSprite.x >= this.wallRight) { this.shotSprite.x = this.wallRight; this.shotVel.x *= -1; this.playWallBounceFeedback(); }
+
+      if (this.shotSprite.y - R <= this.ceilingY) {
+        this.attachShotBubble(null);
+        return;
+      }
+      const hit = this.findCollisionCellAt(this.shotSprite.x, this.shotSprite.y);
+      if (hit) {
+        this.attachShotBubble(hit);
+        return;
+      }
+    }
+  }
+
+  // Quick visual "thunk" on wall contact - a brief horizontal squash plus a
+  // tiny spark, layered on top of the existing bounce sound and physics
+  // (the actual dx reflection is untouched, this is purely cosmetic feedback).
+  playWallBounceFeedback() {
+    AudioManager.wallBounce();
+    if (!this.shotSprite || !this.shotSprite.active) return;
+    const spr = this.shotSprite;
+    this.tweens.killTweensOf(spr); // avoid stacking squashes if bounces happen back-to-back
+    const full = CONFIG.BUBBLE_RADIUS * 2;
+    spr.setDisplaySize(full * 0.75, full * 1.15);
+    this.tweens.add({
+      targets: spr, displayWidth: full, displayHeight: full,
+      duration: 130, ease: 'Back.easeOut'
+    });
+
+    const spark = this.add.image(spr.x, spr.y, 'particle_glow');
+    spark.setDisplaySize(46, 46);
+    spark.setDepth(41);
+    spark.setBlendMode(Phaser.BlendModes.ADD);
+    spark.setAlpha(0.8);
+    this.tweens.add({
+      targets: spark, alpha: 0, scale: 0.3, duration: 180, ease: 'Cubic.easeOut',
+      onComplete: () => { if (spark && spark.active) spark.destroy(); }
+    });
+  }
+
+  findLandingCell(x, y, hitCell) {
+    let candidates = [];
+    if (hitCell && this.board.isValidCell(hitCell.row, hitCell.col)) {
+      candidates = this.board.getNeighbors(hitCell.row, hitCell.col).filter(n => this.board.getColor(n.row, n.col) < 0);
+    }
+    if (candidates.length === 0) {
+      const approxRow = Utils.clamp(Math.round((y - this.board.originY) / this.board.rowH), 0, CONFIG.MAX_ROWS - 1);
+      for (let r = Math.max(0, approxRow - 1); r <= Math.min(CONFIG.MAX_ROWS - 1, approxRow + 1); r++) {
+        const cols = Utils.colsInRow(r);
+        for (let c = 0; c < cols; c++) {
+          if (this.board.getColor(r, c) < 0) candidates.push({ row: r, col: c });
+        }
+      }
+    }
+    if (candidates.length === 0) {
+      console.warn('[Game] No empty landing cell found near', x, y, '- using row 0 fallback.');
+      return { row: 0, col: 0 };
+    }
+    let best = candidates[0], bestD = Infinity;
+    for (const cand of candidates) {
+      const p = this.board.cellToWorld(cand.row, cand.col);
+      const d = Utils.dist(x, y, p.x, p.y);
+      if (d < bestD) { bestD = d; best = cand; }
+    }
+    return best;
+  }
+
+  attachShotBubble(hitCell) {
+    if (!this.shotSprite) return; // already handled/destroyed - avoid double-processing
+    const x = this.shotSprite.x, y = this.shotSprite.y;
+    const target = this.findLandingCell(x, y, hitCell);
+    const colorIndex = this.shotColorIndex;
+    this.shotSprite.destroy();
+    this.shotSprite = null;
+    this.shotVel = null;
+
+    if (!this.board.isValidCell(target.row, target.col) || this.board.getColor(target.row, target.col) >= 0) {
+      console.error('[Game] Landing cell invalid or occupied - aborting attach safely.', target);
+      this.finishShotCycle();
+      return;
+    }
+    this.board.setBubble(target.row, target.col, colorIndex);
+    AudioManager.attach();
+
+    // Quick squash-settle impact animation instead of popping in at full size.
+    const landedSprite = this.board.getSprite(target.row, target.col);
+    if (landedSprite && landedSprite.active) {
+      const full = CONFIG.BUBBLE_RADIUS * 2;
+      landedSprite.setDisplaySize(full * 1.25, full * 0.8);
+      this.tweens.add({
+        targets: landedSprite, displayWidth: full, displayHeight: full,
+        duration: 160, ease: 'Back.easeOut'
+      });
+    }
+
+    this.resolveMatches(target.row, target.col);
+  }
+
+  resolveMatches(row, col) {
+    const group = this.board.findMatchGroup(row, col);
+    if (group.length >= 3) {
+      this.popGroup(group);
+    } else {
+      this.finishShotCycle();
+    }
+  }
+
+  popGroup(group) {
+    const bonus = group.length > 3 ? (group.length - 3) * 30 : 0;
+    const totalScore = group.length * 100 + bonus;
+    this.registerCombo();
+    const isBigMatch = group.length >= 5 || this.comboStreak >= 3;
+
+    group.forEach((cell, i) => {
+      const color = this.board.getColor(cell.row, cell.col);
+      const spr = this.board.getSprite(cell.row, cell.col);
+      // Clear authoritative data immediately so match/float logic downstream
+      // never sees a bubble that's already been popped.
+      this.board.data[cell.row][cell.col] = -1;
+      this.board.sprites[cell.row][cell.col] = null;
+      if (spr && spr.active) {
+        const baseScale = spr.scaleX;
+        spr.setBlendMode(Phaser.BlendModes.NORMAL);
+        // Two-step pop: a quick bright bump outward, then shrink-and-fade away.
+        this.tweens.add({
+          targets: spr, scale: baseScale * 1.3, rotation: (Math.random() - 0.5) * 0.6,
+          duration: 90, delay: i * 16, ease: 'Cubic.easeOut',
+          onComplete: () => {
+            if (!spr || !spr.active) return;
+            this.tweens.add({
+              targets: spr, scale: 0.05, alpha: 0, duration: 160, ease: 'Cubic.easeIn',
+              onComplete: () => { if (spr && spr.active) spr.destroy(); }
+            });
+          }
+        });
+      }
+      this.spawnPopParticles(cell.row, cell.col, color);
+      AudioManager.pop(i);
+    });
+
+    this.showScorePopup(totalScore, isBigMatch);
+    AudioManager.matchFeedback(group.length, isBigMatch); // one haptic/chime per match event, not per bubble
+    if (isBigMatch) this.cameras.main.shake(120, 0.0035); // subtle punch on big/combo matches
+
+    this.time.delayedCall(200, () => {
+      this.resolveFloating();
+    });
+  }
+
+  // Tracks quick successive matches to reward chained shots with a combo
+  // callout. The streak resets automatically if there's a pause between pops.
+  registerCombo() {
+    this.comboStreak = (this.comboStreak || 0) + 1;
+    if (this.comboResetTimer) this.comboResetTimer.remove(false);
+    this.comboResetTimer = this.time.delayedCall(1400, () => { this.comboStreak = 0; });
+  }
+
+  resolveFloating() {
+    const floating = this.board.findFloatingBubbles();
+    if (floating.length > 0) {
+      // Stagger by row so higher clusters lead the collapse, like a real cascade.
+      const minRow = floating.reduce((m, c) => Math.min(m, c.row), floating[0].row);
+      floating.forEach((cell) => {
+        const spr = this.board.getSprite(cell.row, cell.col);
+        const colorIndex = this.board.getColor(cell.row, cell.col);
+        this.board.data[cell.row][cell.col] = -1;
+        this.board.sprites[cell.row][cell.col] = null;
+        if (spr && spr.active) {
+          const delay = (cell.row - minRow) * 40 + Math.random() * 60;
+          const startY = spr.y;
+          const swayTarget = spr.x + (Math.random() - 0.5) * 90;
+          const rot = (Math.random() - 0.5) * 6;
+          const fallDuration = 620 + Math.random() * 140;
+          const full = CONFIG.BUBBLE_RADIUS * 2;
+
+          // 1) Tiny anticipation hop - a brief upward lift + squash before it
+          // actually lets go, so the detachment reads as a deliberate beat
+          // rather than bubbles just silently sliding down.
+          this.tweens.add({
+            targets: spr, y: startY - 12, displayWidth: full * 1.08, displayHeight: full * 0.9,
+            duration: 90, delay, ease: 'Sine.easeOut',
+            onComplete: () => {
+              if (!spr || !spr.active) return;
+              this.spawnFallSpark(spr.x, spr.y, colorIndex); // 2) clear detachment spark
+
+              // 3-5) accelerating fall with rotation + gentle shrink for depth
+              this.tweens.add({
+                targets: spr, y: startY + 780, alpha: 0, rotation: rot,
+                displayWidth: full * 0.72, displayHeight: full * 0.72,
+                duration: fallDuration, ease: 'Cubic.easeIn',
+                onComplete: () => { if (spr && spr.active) spr.destroy(); } // 7) fade/removal
+              });
+              this.tweens.add({ targets: spr, x: swayTarget, duration: fallDuration, ease: 'Sine.easeInOut' });
+
+              // 6) one tasteful trailing sparkle partway through the drop (capped
+              // to ~half of falling bubbles so a big cascade doesn't spike particle count)
+              if (Math.random() < 0.5) {
+                this.time.delayedCall(fallDuration * 0.45, () => {
+                  if (spr && spr.active) this.spawnFallSpark(spr.x, spr.y, colorIndex);
+                });
+              }
+            }
+          });
+        }
+      });
+      this.showScorePopup(floating.length * 40, false);
+      AudioManager.fall();
+    }
+    this.finishShotCycle();
+  }
+
+  // A single small, brief additive spark - cheaper than the full pop-particle
+  // burst, used for the falling-bubble detachment/trail beats.
+  spawnFallSpark(x, y, colorIndex) {
+    const colorDef = CONFIG.COLORS[Utils.clamp(colorIndex, 0, CONFIG.COLORS.length - 1)];
+    const p = this.add.image(x, y, 'particle_glow');
+    p.setTint(colorDef.hex);
+    p.setDisplaySize(22, 22);
+    p.setDepth(38);
+    p.setBlendMode(Phaser.BlendModes.ADD);
+    p.setAlpha(0.9);
+    this.tweens.add({
+      targets: p, y: y - 18, alpha: 0, scale: 0.3, duration: 320, ease: 'Cubic.easeOut',
+      onComplete: () => { if (p && p.active) p.destroy(); }
+    });
+  }
+
+  spawnPopParticles(row, col, colorIndex) {
+    const pos = this.board.cellToWorld(row, col);
+    const colorDef = CONFIG.COLORS[Utils.clamp(colorIndex, 0, CONFIG.COLORS.length - 1)];
+    // Kept small (6/particle burst) and short-lived for mobile GPU/CPU headroom.
+    const count = 6;
+    for (let i = 0; i < count; i++) {
+      const angle = (Math.PI * 2 * i) / count + Math.random() * 0.4;
+      const speed = 120 + Math.random() * 140;
+      const p = this.add.image(pos.x, pos.y, 'particle_glow');
+      p.setTint(colorDef.hex);
+      p.setDisplaySize(28, 28);
+      p.setDepth(40);
+      p.setBlendMode(Phaser.BlendModes.ADD); // glowy, cheap to render, no extra textures needed
+      this.tweens.add({
+        targets: p,
+        x: pos.x + Math.cos(angle) * speed,
+        y: pos.y + Math.sin(angle) * speed,
+        alpha: 0,
+        scale: 0.2,
+        duration: 420 + Math.random() * 150,
+        ease: 'Cubic.easeOut',
+        onComplete: () => { if (p && p.active) p.destroy(); }
+      });
+    }
+  }
+
+  /* ------------------------- CYCLE / WIN / LOSE ---------------------------- */
+  finishShotCycle() {
+    if (this.isGameOver) return;
+    this.shotsRemaining = Math.max(0, this.shotsRemaining - 1);
+    this.updateHUD();
+    this.currentColorIndex = this.nextColorIndex;
+    this.nextColorIndex = this.pickRandomColor();
+    this.refreshQueueSprites(true);
+    this.isShooting = false;
+
+    if (this.board.remainingBubbleCount() === 0 || this.score >= this.level.targetScore) {
+      this.triggerWin();
+      return;
+    }
+    if (this.board.lowestOccupiedRow() >= CONFIG.DANGER_ROW) {
+      this.triggerLose();
+      return;
+    }
+    if (this.shotsRemaining <= 0) {
+      this.triggerLose();
+      return;
+    }
+  }
+
+  triggerWin() {
+    if (this.isGameOver) return;
+    this.isGameOver = true;
+    AudioManager.win();
+    let stars = 1;
+    if (this.score >= this.level.targetScore * 1.6) stars = 3;
+    else if (this.score >= this.level.targetScore * 1.25) stars = 2;
+
+    GAME_SAVE = SaveManager.load();
+    const prevStars = Utils.safeGet(GAME_SAVE.stars, this.level.id, 0);
+    GAME_SAVE.stars[this.level.id] = Math.max(prevStars, stars);
+    const prevBest = Utils.safeGet(GAME_SAVE.bestScore, this.level.id, 0);
+    GAME_SAVE.bestScore[this.level.id] = Math.max(prevBest, this.score);
+    if (this.level.id + 1 > GAME_SAVE.unlockedLevel && this.level.id + 1 <= LEVELS.length) {
+      GAME_SAVE.unlockedLevel = this.level.id + 1;
+    }
+    SaveManager.save(GAME_SAVE);
+
+    AdHooks.onLevelComplete(this.level.id, this.score); // no-op today; future ad seam
+    this.showEndOverlay(true, stars);
+  }
+
+  triggerLose() {
+    if (this.isGameOver) return;
+    this.isGameOver = true;
+    AudioManager.lose();
+    AdHooks.onGameOver(this.level.id, this.score); // no-op today; future ad seam
+    this.showEndOverlay(false, 0);
+  }
+
+  showEndOverlay(won, stars) {
+    const w = CONFIG.DESIGN_W, h = CONFIG.DESIGN_H;
+    const overlay = this.add.container(0, 0).setDepth(200);
+    const bg = this.add.rectangle(w / 2, h / 2, w, h, 0x000000, 0.6).setInteractive();
+    const panel = this.add.image(w / 2, h / 2, 'panel_modal').setDisplaySize(820, 980);
+    overlay.add([bg, panel]);
+
+    const title = this.add.text(w / 2, h / 2 - 380, won ? 'Level Complete!' : 'Out of Shots', {
+      fontFamily: 'Segoe UI, Arial', fontSize: '58px', color: won ? '#3ecf6e' : '#e94560', fontStyle: 'bold'
+    }).setOrigin(0.5);
+    overlay.add(title);
+
+    if (won) {
+      for (let s = 0; s < 3; s++) {
+        const st = this.add.image(w / 2 - 90 + s * 90, h / 2 - 260, s < stars ? 'star_filled' : 'star_empty');
+        st.setDisplaySize(100, 100);
+        st.setScale(0);
+        overlay.add(st);
+        this.tweens.add({ targets: st, scale: 0.86, duration: 320, delay: 200 + s * 150, ease: 'Back.easeOut' });
+      }
+    }
+
+    const scoreLabel = this.add.text(w / 2, h / 2 - 120, 'Score: ' + this.score, {
+      fontFamily: 'Segoe UI, Arial', fontSize: '46px', color: '#ffffff', fontStyle: 'bold'
+    }).setOrigin(0.5);
+    overlay.add(scoreLabel);
+
+    if (won && this.level.id < LEVELS.length) {
+      const nextBtn = createButton(this, w / 2, h / 2 + 40, 500, 130, 'panel_primary', 'NEXT LEVEL', 42, () => {
+        this.scene.restart({ levelId: this.level.id + 1 });
+      });
+      overlay.add(nextBtn);
+    } else if (won) {
+      const doneTxt = this.add.text(w / 2, h / 2 + 40, 'All levels complete!', {
+        fontFamily: 'Segoe UI, Arial', fontSize: '36px', color: '#ffe98a'
+      }).setOrigin(0.5);
+      overlay.add(doneTxt);
+    } else {
+      const retryBtn = createButton(this, w / 2, h / 2 + 40, 500, 130, 'panel_primary', 'RETRY', 42, () => {
+        this.scene.restart({ levelId: this.level.id });
+      });
+      overlay.add(retryBtn);
+    }
+
+    const menuBtn = createButton(this, w / 2, h / 2 + 190, 500, 120, 'panel_secondary', 'LEVEL SELECT', 38, () => {
+      this.scene.start('LevelSelect');
+    });
+    overlay.add(menuBtn);
+
+    this.endOverlay = overlay;
+  }
+
+  /* ------------------------------- PAUSE ------------------------------------ */
+  openPause() {
+    if (this.isPaused || this.isGameOver || this.pauseOverlay) return;
+    this.isPaused = true;
+    this.isAiming = false;
+    this.aimGraphics.clear();
+    const w = CONFIG.DESIGN_W, h = CONFIG.DESIGN_H;
+    const overlay = this.add.container(0, 0).setDepth(200);
+    const bg = this.add.rectangle(w / 2, h / 2, w, h, 0x000000, 0.6).setInteractive();
+    const panel = this.add.image(w / 2, h / 2, 'panel_modal').setDisplaySize(760, 900);
+    const title = this.add.text(w / 2, h / 2 - 380, 'Paused', {
+      fontFamily: 'Segoe UI, Arial', fontSize: '56px', color: '#ffffff', fontStyle: 'bold'
+    }).setOrigin(0.5);
+    overlay.add([bg, panel, title]);
+
+    const resumeBtn = createButton(this, w / 2, h / 2 - 220, 480, 120, 'panel_primary', 'RESUME', 40, () => {
+      this.closePause();
+    });
+    const restartBtn = createButton(this, w / 2, h / 2 - 80, 480, 120, 'panel_secondary', 'RESTART', 40, () => {
+      this.scene.restart({ levelId: this.level.id });
+    });
+    const soundToggle = createToggle(this, w / 2, h / 2 + 60, 'Sound', AudioManager.soundOn, v => AudioManager.setSoundOn(v));
+    const musicToggle = createToggle(this, w / 2, h / 2 + 140, 'Music', AudioManager.musicOn, v => AudioManager.setMusicOn(v));
+    const menuBtn = createButton(this, w / 2, h / 2 + 280, 480, 120, 'panel_secondary', 'LEVEL SELECT', 38, () => {
+      this.scene.start('LevelSelect');
+    });
+    overlay.add([resumeBtn, restartBtn, soundToggle, musicToggle, menuBtn]);
+    this.pauseOverlay = overlay;
+  }
+
+  closePause() {
+    if (!this.pauseOverlay) return;
+    this.pauseOverlay.destroy();
+    this.pauseOverlay = null;
+    this.isPaused = false;
+  }
+}
+
+/* ============================== GAME BOOTSTRAP ============================= */
+window.addEventListener('error', (e) => {
+  console.error('[Global] Uncaught error:', e.message, e.error);
+});
+
+const phaserConfig = {
+  type: Phaser.AUTO,
+  parent: 'game-root',
+  width: CONFIG.DESIGN_W,
+  height: CONFIG.DESIGN_H,
+  backgroundColor: '#0a0e1a',
+  scale: {
+    mode: Phaser.Scale.FIT,
+    autoCenter: Phaser.Scale.CENTER_BOTH,
+    width: CONFIG.DESIGN_W,
+    height: CONFIG.DESIGN_H
+  },
+  input: { activePointers: 2 },
+  scene: [BootScene, PreloadScene, MenuScene, LevelSelectScene, GameScene]
+};
+
+let GAME_INSTANCE = null;
+try {
+  GAME_INSTANCE = new Phaser.Game(phaserConfig);
+} catch (e) {
+  console.error('[Boot] Failed to create Phaser game instance:', e);
+  document.getElementById('game-root').innerHTML =
+    '<p style="color:#fff;font-family:sans-serif;padding:20px;">Failed to start the game. Please reload the page.</p>';
+}
+</script>
+</body>
+</html>

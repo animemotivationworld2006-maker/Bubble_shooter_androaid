@@ -1,0 +1,21 @@
+{
+  "name": "bubble-shooter",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bubble Shooter - Phaser 3 casual puzzle game, packaged for Android via Capacitor.",
+  "scripts": {
+    "fetch:phaser": "mkdir -p www/vendor && curl -sSL -o www/vendor/phaser.min.js https://cdnjs.cloudflare.com/ajax/libs/phaser/3.70.0/phaser.min.js",
+    "cap:add:android": "npx cap add android",
+    "cap:sync": "npx cap sync android",
+    "assets:generate": "npx @capacitor/assets generate --android",
+    "android:build-debug": "cd android && ./gradlew assembleDebug"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.1.2",
+    "@capacitor/core": "^6.1.2"
+  },
+  "devDependencies": {
+    "@capacitor/assets": "^3.0.5",
+    "@capacitor/cli": "^6.1.2"
+  }
+}

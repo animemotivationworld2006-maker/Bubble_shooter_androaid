@@ -1,0 +1,13 @@
+{
+  "appId": "com.bubbleshooter.game",
+  "appName": "Bubble Shooter",
+  "webDir": "www",
+  "bundledWebRuntime": false,
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false,
+    "webContentsDebuggingEnabled": false
+  }
+}
